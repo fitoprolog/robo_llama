@@ -1,80 +1,85 @@
 import os
 import time
 import math
-import pickle
+import json
 import argparse
+import pickle
 from contextlib import nullcontext
-
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
+from pathlib import Path
+import sentencepiece as spm
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import ModelArgs, Transformer
-from dataloader import create_dataloader, preprocess_text_file, create_dummy_conditions
-from tokenizer import get_encoding, SPTokenizer
+from bitnet_model import BitModelArgs, BitTransformer
+from dataloader import create_dataloader
 
-def get_args():
-    parser = argparse.ArgumentParser()
-    # Data parameters
-    parser.add_argument('--text_path', type=str, required=True, help='Path to text data file')
-    parser.add_argument('--condition_path', type=str, required=True, help='Path to condition vectors')
-    parser.add_argument('--out_dir', type=str, required=True, help='Directory to save checkpoints')
-    parser.add_argument('--raw_text_file', type=str, default=None, help='Raw text file to preprocess')
-    parser.add_argument('--preprocess', action='store_true', help='Run preprocessing on raw text file')
-    parser.add_argument('--create_dummy_conditions', action='store_true', help='Create dummy condition vectors')
-    parser.add_argument('--random_conditions', action='store_true', help='Use random values for dummy conditions')
+class ColorDataset(Dataset):
+    def __init__(self, text_path, embeddings_path, tokenizer_path, max_seq_len=256):
+        self.text_data = []
+        with open(text_path, 'r') as f:
+            for line in f:
+                self.text_data.append(json.loads(line))
+        
+        self.embeddings = np.load(embeddings_path)
+        self.tokenizer = spm.SentencePieceProcessor()
+        self.tokenizer.load(tokenizer_path)
+        self.max_seq_len = max_seq_len
+        
+        # Verify embeddings shape
+        if self.embeddings.shape[1] != 3:
+            raise ValueError(f"Expected RGB values (3 dimensions), got {self.embeddings.shape[1]} dimensions")
+        
+    def __len__(self):
+        return len(self.text_data)
     
-    # Model parameters
-    parser.add_argument('--dim', type=int, default=4096, help='Model dimension')
-    parser.add_argument('--n_layers', type=int, default=32, help='Number of layers')
-    parser.add_argument('--n_heads', type=int, default=32, help='Number of attention heads')
-    parser.add_argument('--n_kv_heads', type=int, default=None, help='Number of key/value heads (optional)')
-    parser.add_argument('--vocab_size', type=int, default=32000, help='Vocabulary size')
-    parser.add_argument('--multiple_of', type=int, default=256, help='Hidden dimension must be multiple of this')
-    parser.add_argument('--norm_eps', type=float, default=1e-5, help='Layer norm epsilon')
-    parser.add_argument('--max_seq_len', type=int, default=2048, help='Maximum sequence length')
-    parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
-    parser.add_argument('--condition_dim', type=int, default=768, help='Dimension of condition vectors')
-    parser.add_argument('--condition_proj_dim', type=int, default=None, help='Projection dimension for conditions')
+    def pad_sequence(self, seq, pad_id=0):
+        if len(seq) > self.max_seq_len:
+            return seq[:self.max_seq_len]
+        return seq + [pad_id] * (self.max_seq_len - len(seq))
     
-    # Training parameters
-    parser.add_argument('--tokenizer_name', type=str, default='sp_model', help='Name of the SentencePiece model')
-    parser.add_argument('--batch_size', type=int, default=12, help='Batch size per GPU')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
-    parser.add_argument('--max_iters', type=int, default=20000, help='Maximum number of training iterations')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading')
-    
-    # Training parameters
-    parser.add_argument('--learning_rate', type=float, default=6e-4, help='Learning rate')
-    parser.add_argument('--min_lr', type=float, default=6e-5, help='Minimum learning rate')
-    parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
-    parser.add_argument('--beta2', type=float, default=0.95, help='Adam beta2')
-    parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
-    parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--decay_lr', action='store_true', help='Decay learning rate')
-    parser.add_argument('--warmup_iters', type=int, default=1000, help='Warmup iterations')
-    
-    # System parameters
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--dtype', type=str, default='bfloat16', help='Data type (float32, bfloat16, or float16)')
-    parser.add_argument('--compile', action='store_true', help='Use PyTorch 2.0 compiler')
-    parser.add_argument('--grad_checkpoint', action='store_true', help='Use gradient checkpointing')
-    
-    # Distributed training parameters
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--ddp', action='store_true', help='Use DDP for distributed training')
-    
-    # Logging and saving
-    parser.add_argument('--log_interval', type=int, default=1, help='Log training stats every N steps')
-    parser.add_argument('--save_interval', type=int, default=1000, help='Save checkpoint every N steps')
-    parser.add_argument('--eval_interval', type=int, default=500, help='Evaluate every N steps')
-    parser.add_argument('--eval_iters', type=int, default=100, help='Number of iterations for evaluation')
-    parser.add_argument('--resume', type=str, default=None, help='Resume training from checkpoint')
-    parser.add_argument('--eval_only', action='store_true', help='Only run evaluation')
-    
-    return parser.parse_args()
+    def __getitem__(self, idx):
+        item = self.text_data[idx]
+        text = item['text']
+        embedding = self.embeddings[idx]
+        
+        # Tokenize text
+        tokens = self.tokenizer.encode_as_ids(text)
+        tokens = self.pad_sequence(tokens)
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        
+        # Create targets (shifted by 1 position)
+        targets = torch.roll(tokens, shifts=-1)
+        targets[-1] = -1  # Mask the last target
+        
+        # Ensure condition vector has the correct shape (batch_size, condition_dim)
+        condition = torch.tensor(embedding, dtype=torch.float32).view(-1)  # Flatten to 1D
+        if condition.shape[0] != 3:  # RGB values
+            raise ValueError(f"Expected condition vector of length 3 (RGB), got {condition.shape[0]}")
+        
+        return {
+            'tokens': tokens,
+            'targets': targets,
+            'condition': condition
+        }
+
+def create_dataloader(text_path, embeddings_path, tokenizer_path, max_seq_len=256, batch_size=32, num_workers=4):
+    dataset = ColorDataset(
+        text_path=text_path,
+        embeddings_path=os.path.join(os.path.dirname(embeddings_path), 'conditions.npy'),  # Use conditions.npy instead
+        tokenizer_path=tokenizer_path,
+        max_seq_len=max_seq_len
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
+    )
 
 def setup_dtype_context(dtype_str):
     """Set up dtype for model and dtype context for operations"""
@@ -142,17 +147,16 @@ def train(args):
     
     # Create data loader
     train_loader = create_dataloader(
-        text_path=args.text_path,
-        condition_path=args.condition_path,
+        text_path=os.path.join(args.data_dir, 'text_data.jsonl'),
+        embeddings_path=os.path.join(args.data_dir, 'embeddings.npy'),
+        tokenizer_path=args.tokenizer_path,
+        max_seq_len=args.max_seq_len,
         batch_size=args.batch_size,
-        max_length=args.max_seq_len,
-        tokenizer_name=args.tokenizer_name,
-        condition_dim=args.condition_dim,
-        num_workers=args.num_workers,
+        num_workers=args.num_workers
     )
     
     # Create model
-    model_args = ModelArgs(
+    model_args = BitModelArgs(
         dim=args.dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -163,9 +167,9 @@ def train(args):
         max_seq_len=args.max_seq_len,
         dropout=args.dropout,
         condition_dim=args.condition_dim,
-        condition_proj_dim=args.condition_proj_dim,
+        condition_proj_dim=args.condition_proj_dim or args.dim,  # Default to model dim if not specified
     )
-    model = Transformer(model_args)
+    model = BitTransformer(model_args)
     
     # Set up model for training
     model.to(device)
@@ -179,11 +183,11 @@ def train(args):
         model = DDP(model, device_ids=[ddp_local_rank])
     
     # Optimizer
-    optimizer = model.configure_optimizers(
-        weight_decay=args.weight_decay,
-        learning_rate=args.learning_rate,
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
         betas=(args.beta1, args.beta2),
-        device_type=device_type
+        weight_decay=args.weight_decay
     )
     
     # Load checkpoint if provided
@@ -226,7 +230,7 @@ def train(args):
         
         # Move batch to device
         tokens = batch['tokens'].to(device)
-        conditions = batch['conditions'].to(device)  
+        conditions = batch['condition'].to(device)  
         targets = batch['targets'].to(device)
         
         # Set learning rate
@@ -326,7 +330,7 @@ def evaluate(model, dataloader, ctx, device, max_iters=None):
             batch = next(eval_iter)
         
         tokens = batch['tokens'].to(device)
-        conditions = batch['conditions'].to(device)
+        conditions = batch['condition'].to(device)
         targets = batch['targets'].to(device)
         
         with ctx:
@@ -342,52 +346,64 @@ def evaluate(model, dataloader, ctx, device, max_iters=None):
     model.train()
     return torch.tensor(losses).mean().item()
 
-@torch.no_grad()
-def generate_sample(model, prompt_tokens, condition=None, max_new_tokens=100, temperature=0.8, top_k=200, device='cuda'):
-    """Generate text sample using the model"""
-    model.eval()
+def get_args():
+    parser = argparse.ArgumentParser()
     
-    # Prepare input tokens
-    x = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    # Data parameters
+    parser.add_argument('--data_dir', type=str, default='color_dataset', help='Directory containing the dataset')
+    parser.add_argument('--tokenizer_path', type=str, required=True, help='Path to SentencePiece model')
+    parser.add_argument('--out_dir', type=str, default='checkpoints', help='Directory to save checkpoints')
     
-    # Prepare condition if provided
-    if condition is not None:
-        condition = torch.tensor(condition, dtype=torch.float32, device=device).unsqueeze(0)
+    # Model parameters
+    parser.add_argument('--dim', type=int, default=512, help='Model dimension')
+    parser.add_argument('--n_layers', type=int, default=6, help='Number of layers')
+    parser.add_argument('--n_heads', type=int, default=6, help='Number of attention heads')
+    parser.add_argument('--n_kv_heads', type=int, default=None, help='Number of key/value heads (optional)')
+    parser.add_argument('--vocab_size', type=int, default=32000, help='Vocabulary size')
+    parser.add_argument('--multiple_of', type=int, default=256, help='Hidden dimension must be multiple of this')
+    parser.add_argument('--norm_eps', type=float, default=1e-5, help='Layer norm epsilon')
+    parser.add_argument('--max_seq_len', type=int, default=2048, help='Maximum sequence length')
+    parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
+    parser.add_argument('--condition_dim', type=int, default=3, help='Dimension of condition vectors (RGB)')
+    parser.add_argument('--condition_proj_dim', type=int, default=None, help='Projection dimension for conditions')
     
-    # Generate
-    y = model.generate(x, max_new_tokens, condition=condition, temperature=temperature, top_k=top_k)
+    # Training parameters
+    parser.add_argument('--tokenizer_name', type=str, default='sp_model', help='Name of the SentencePiece model')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size per GPU')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--max_iters', type=int, default=20000, help='Maximum number of training iterations')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading')
     
-    return y[0].tolist()
-
-def preprocess(args):
-    """Run preprocessing steps"""
-    if args.preprocess and args.raw_text_file:
-        print(f"Preprocessing raw text file: {args.raw_text_file}")
-        preprocess_text_file(
-            input_file=args.raw_text_file,
-            output_jsonl=args.text_path,
-            chunk_size=args.max_seq_len,
-            tokenizer_name=args.tokenizer_name,
-        )
+    # Training parameters
+    parser.add_argument('--learning_rate', type=float, default=6e-4, help='Learning rate')
+    parser.add_argument('--min_lr', type=float, default=6e-5, help='Minimum learning rate')
+    parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
+    parser.add_argument('--beta2', type=float, default=0.95, help='Adam beta2')
+    parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
+    parser.add_argument('--decay_lr', action='store_true', help='Decay learning rate')
+    parser.add_argument('--warmup_iters', type=int, default=1000, help='Warmup iterations')
     
-    if args.create_dummy_conditions:
-        print(f"Creating dummy condition vectors at: {args.condition_path}")
-        create_dummy_conditions(
-            jsonl_file=args.text_path,
-            output_file=args.condition_path,
-            condition_dim=args.condition_dim,
-            random_init=args.random_conditions,
-        )
-
-def main():
-    args = get_args()
+    # System parameters
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
+    parser.add_argument('--dtype', type=str, default='bfloat16', help='Data type (float32, bfloat16, or float16)')
+    parser.add_argument('--compile', action='store_true', help='Use PyTorch 2.0 compiler')
+    parser.add_argument('--grad_checkpoint', action='store_true', help='Use gradient checkpointing')
+    parser.add_argument('--eval_only', action='store_true', help='Only run evaluation')
     
-    # Run preprocessing if requested
-    if args.preprocess or args.create_dummy_conditions:
-        preprocess(args)
+    # Distributed training parameters
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--ddp', action='store_true', help='Use DDP for distributed training')
     
-    # Train or evaluate
-    train(args)
+    # Logging and saving
+    parser.add_argument('--log_interval', type=int, default=1, help='Log training stats every N steps')
+    parser.add_argument('--save_interval', type=int, default=1000, help='Save checkpoint every N steps')
+    parser.add_argument('--eval_interval', type=int, default=500, help='Evaluate every N steps')
+    parser.add_argument('--eval_iters', type=int, default=100, help='Number of iterations for evaluation')
+    parser.add_argument('--resume', type=str, default=None, help='Resume training from checkpoint')
+    
+    return parser.parse_args()
 
 if __name__ == '__main__':
-    main()
+    args = get_args()
+    train(args) 

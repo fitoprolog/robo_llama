@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Optional, Tuple, Union
-import tiktoken
+from tokenizer import get_encoding
 
 class MultimodalDataset(Dataset):
     """Dataset for training a multimodal LLM with paired text and conditioning vectors"""
@@ -13,23 +13,23 @@ class MultimodalDataset(Dataset):
         self, 
         text_path: str,
         condition_path: str,
-        tokenizer_name: str = "gpt2",  # default to use the same tokenizer as in Karpathy's implementation
+        tokenizer_name: str = "sp_model",  # default to use our SentencePiece model
         max_length: int = 2048,
-        condition_dim: int = 768,  # Default for CLIP embeddings
+        condition_dim: int = 3,  # RGB values
     ):
         """
         Args:
             text_path: Path to text data file (jsonl format where each line has a 'text' field)
             condition_path: Path to conditioning vectors (numpy files matching the text data)
-            tokenizer_name: Name of the tokenizer to use
+            tokenizer_name: Name of the SentencePiece model to use
             max_length: Maximum sequence length
-            condition_dim: Dimension of conditioning vectors
+            condition_dim: Dimension of conditioning vectors (3 for RGB)
         """
         self.max_length = max_length
         self.condition_dim = condition_dim
         
         # Load tokenizer
-        self.tokenizer = tiktoken.get_encoding(tokenizer_name)
+        self.tokenizer = get_encoding(tokenizer_name)
         
         # Load text data
         self.texts = []
@@ -83,8 +83,8 @@ def create_dataloader(
     condition_path: str,
     batch_size: int,
     max_length: int = 2048,
-    tokenizer_name: str = "gpt2",
-    condition_dim: int = 768,
+    tokenizer_name: str = "sp_model",
+    condition_dim: int = 3,  # RGB values
     shuffle: bool = True,
     num_workers: int = 4,
 ):
@@ -104,7 +104,10 @@ def create_dataloader(
         
         # Prepare tensors
         tokens = torch.zeros((len(batch), max_len), dtype=torch.long)
+        # Stack conditions and ensure they are 2D [batch_size, condition_dim]
         conditions = torch.stack([item['condition'] for item in batch])
+        if conditions.dim() == 3:  # If conditions are [batch_size, seq_len, condition_dim]
+            conditions = conditions.mean(dim=1)  # Average over sequence dimension
         
         # Create targets (shifted tokens) and fill tokens
         targets = torch.zeros((len(batch), max_len), dtype=torch.long).fill_(-1)  # -1 is ignored in loss
@@ -140,7 +143,7 @@ def preprocess_text_file(
     output_jsonl: str,
     chunk_size: int = 2048,
     overlap: int = 0,
-    tokenizer_name: str = "gpt2",
+    tokenizer_name: str = "sp_model",
 ):
     """
     Preprocess a raw text file into jsonl format with chunking
@@ -150,10 +153,10 @@ def preprocess_text_file(
         output_jsonl: Path to output jsonl file
         chunk_size: Maximum chunk size in tokens
         overlap: Number of tokens to overlap between chunks
-        tokenizer_name: Name of the tokenizer to use
+        tokenizer_name: Name of the SentencePiece model to use
     """
     # Load tokenizer
-    tokenizer = tiktoken.get_encoding(tokenizer_name)
+    tokenizer = get_encoding(tokenizer_name)
     
     # Read input file
     with open(input_file, 'r', encoding='utf-8') as f:
@@ -182,7 +185,7 @@ def preprocess_text_file(
 def create_dummy_conditions(
     jsonl_file: str,
     output_file: str,
-    condition_dim: int = 768,
+    condition_dim: int = 3,  # RGB values
     random_init: bool = False,
 ):
     """
@@ -191,8 +194,8 @@ def create_dummy_conditions(
     Args:
         jsonl_file: Path to jsonl file with text data
         output_file: Path to output numpy file for conditions
-        condition_dim: Dimension of condition vectors
-        random_init: If True, initialize with random values; otherwise with zeros
+        condition_dim: Dimension of condition vectors (3 for RGB)
+        random_init: If True, initialize with random RGB values; otherwise with zeros
     """
     # Count lines in jsonl file
     with open(jsonl_file, 'r', encoding='utf-8') as f:
@@ -200,10 +203,11 @@ def create_dummy_conditions(
     
     # Create condition vectors
     if random_init:
-        conditions = np.random.randn(count, condition_dim).astype(np.float32)
+        # Generate random RGB values between 0 and 1
+        conditions = np.random.uniform(0, 1, (count, condition_dim)).astype(np.float32)
     else:
         conditions = np.zeros((count, condition_dim), dtype=np.float32)
     
     # Save to file
     np.save(output_file, conditions)
-    print(f"Created {count} condition vectors with dimension {condition_dim}")
+    print(f"Created {count} RGB condition vectors")

@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import ModelArgs, Transformer
+from bitnet_model import BitModelArgs, BitTransformer
 from dataloader import create_dataloader, preprocess_text_file, create_dummy_conditions
 from tokenizer import get_encoding, SPTokenizer
 
@@ -72,7 +72,6 @@ def get_args():
     parser.add_argument('--eval_interval', type=int, default=500, help='Evaluate every N steps')
     parser.add_argument('--eval_iters', type=int, default=100, help='Number of iterations for evaluation')
     parser.add_argument('--resume', type=str, default=None, help='Resume training from checkpoint')
-    parser.add_argument('--eval_only', action='store_true', help='Only run evaluation')
     
     return parser.parse_args()
 
@@ -152,7 +151,7 @@ def train(args):
     )
     
     # Create model
-    model_args = ModelArgs(
+    model_args = BitModelArgs(
         dim=args.dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -165,7 +164,7 @@ def train(args):
         condition_dim=args.condition_dim,
         condition_proj_dim=args.condition_proj_dim,
     )
-    model = Transformer(model_args)
+    model = BitTransformer(model_args)
     
     # Set up model for training
     model.to(device)
@@ -390,4 +389,4 @@ def main():
     train(args)
 
 if __name__ == '__main__':
-    main()
+    main() 

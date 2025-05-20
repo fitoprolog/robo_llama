@@ -4,8 +4,8 @@ import time
 import json
 import numpy as np
 import torch
-import tiktoken
 from model import ModelArgs, Transformer
+from tokenizer import get_encoding
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -14,7 +14,7 @@ def get_args():
     parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k sampling value')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--tokenizer_name', type=str, default='gpt2', help='Tokenizer name')
+    parser.add_argument('--tokenizer_name', type=str, default='sp_model', help='Name of the SentencePiece model')
     return parser.parse_args()
 
 def load_model(checkpoint_path, device):
@@ -75,9 +75,10 @@ def main():
     device = torch.device(args.device)
 
     model, config = load_model(args.checkpoint, device)
-    tokenizer = tiktoken.get_encoding(args.tokenizer_name)
+    tokenizer = get_encoding(args.tokenizer_name)
     
     print("💡 Model is ready.")
+    print(f"📊 Model expects condition vectors of dimension: {config['condition_dim']}")
     print("🔁 Type 'quit' anytime to exit.\n")
     
     while True:
@@ -85,12 +86,17 @@ def main():
         if prompt.lower() == "quit":
             break
 
-        raw_embed = input("🎨 Enter a condition vector (comma-separated values): ").strip()
+        print(f"🎨 Enter {config['condition_dim']} comma-separated values for the condition vector:")
+        raw_embed = input().strip()
         if raw_embed.lower() == "quit":
             break
 
         try:
-            condition = np.array([float(v) for v in raw_embed.split(',')], dtype=np.float32)
+            values = [float(v) for v in raw_embed.split(',')]
+            if len(values) != config['condition_dim']:
+                print(f"❌ Error: Expected {config['condition_dim']} values, but got {len(values)}")
+                continue
+            condition = np.array(values, dtype=np.float32)
         except Exception as e:
             print(f"❌ Failed to parse the condition vector: {e}")
             continue
@@ -110,5 +116,5 @@ def main():
         print(output)
         print("-" * 50)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

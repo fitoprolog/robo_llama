@@ -4,8 +4,8 @@ import time
 import json
 import numpy as np
 import torch
-import tiktoken
 from model import ModelArgs, Transformer
+from tokenizer import get_encoding
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -16,7 +16,7 @@ def get_args():
     parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature')
     parser.add_argument('--top_k', type=int, default=200, help='Sample from top k probable tokens')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--tokenizer_name', type=str, default='gpt2', help='Name of the tokenizer')
+    parser.add_argument('--tokenizer_name', type=str, default='sp_model', help='Name of the SentencePiece model')
     parser.add_argument('--output_file', type=str, default=None, help='Path to save output')
     parser.add_argument('--interactive', action='store_true', help='Interactive mode')
     return parser.parse_args()
@@ -148,7 +148,7 @@ def main():
     model, config = load_model(args.checkpoint, device)
     
     # Load tokenizer
-    tokenizer = tiktoken.get_encoding(args.tokenizer_name)
+    tokenizer = get_encoding(args.tokenizer_name)
     
     # Load condition vector
     condition = load_condition_vector(args.condition_vector)

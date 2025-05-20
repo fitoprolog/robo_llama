@@ -1,83 +1,155 @@
-import numpy as np
 import json
 import random
-import os
+import numpy as np
+from typing import List, Dict, Tuple
+from dataclasses import dataclass
+from pathlib import Path
 
-# Define rainbow-ish colors with RGB normalized (0 to 1)
-COLOR_NAMES = [
-    ("red", [1.0, 0.0, 0.0]),
-    ("orange", [1.0, 0.5, 0.0]),
-    ("yellow", [1.0, 1.0, 0.0]),
-    ("green", [0.0, 1.0, 0.0]),
-    ("cyan", [0.0, 1.0, 1.0]),
-    ("blue", [0.0, 0.0, 1.0]),
-    ("violet", [0.5, 0.0, 1.0]),
-    ("magenta", [1.0, 0.0, 1.0]),
-]
+@dataclass
+class ColorSample:
+    rgb: Tuple[float, float, float]  # RGB values between 0 and 1
+    description: str
 
-PHRASE_TEMPLATES = [
-    "Look at this beautiful {} and {} blend.",
-    "Here we see some {} mixed with {} tones.",
-    "A dash of {} alongside a touch of {}.",
-    "Such rich {} combined with subtle {}.",
-    "Oh this is some {} and {} magic.",
-    "Deep {} melts into fresh {}.",
-]
-
-def generate_dataset(
-    output_jsonl: str,
-    output_npy: str,
-    num_samples: int = 100,
-    condition_dim: int = 6,  # 3 + 3 (RGB + RGB)
-    seed: int = 42,
-):
-    random.seed(seed)
-    np.random.seed(seed)
-
-    # Filter out low intensity colors
-    valid_colors = [c for c in COLOR_NAMES if max(c[1]) >= 0.3]
+def generate_color_descriptions(rgb: Tuple[float, float, float]) -> List[str]:
+    """Generate multiple descriptions for a color"""
+    r, g, b = rgb
     
-    texts = []
-    conditions = []
+    # Color name templates
+    templates = [
+        "This is a {color} color with RGB values ({r:.2f}, {g:.2f}, {b:.2f}).",
+        "The color shown is {color}, with red={r:.2f}, green={g:.2f}, and blue={b:.2f}.",
+        "A {color} shade with RGB coordinates ({r:.2f}, {g:.2f}, {b:.2f}).",
+        "This {color} hue has RGB components of {r:.2f}, {g:.2f}, and {b:.2f}.",
+        "The displayed color is {color}, specified by RGB({r:.2f}, {g:.2f}, {b:.2f})."
+    ]
+    
+    # Color descriptions based on RGB values
+    if r > 0.8 and g < 0.2 and b < 0.2:
+        color_name = "bright red"
+    elif r < 0.2 and g > 0.8 and b < 0.2:
+        color_name = "bright green"
+    elif r < 0.2 and g < 0.2 and b > 0.8:
+        color_name = "bright blue"
+    elif r > 0.8 and g > 0.8 and b < 0.2:
+        color_name = "yellow"
+    elif r > 0.8 and g < 0.2 and b > 0.8:
+        color_name = "magenta"
+    elif r < 0.2 and g > 0.8 and b > 0.8:
+        color_name = "cyan"
+    elif r > 0.8 and g > 0.8 and b > 0.8:
+        color_name = "white"
+    elif r < 0.2 and g < 0.2 and b < 0.2:
+        color_name = "black"
+    elif r > 0.6 and g > 0.6 and b > 0.6:
+        color_name = "light gray"
+    elif r < 0.4 and g < 0.4 and b < 0.4:
+        color_name = "dark gray"
+    else:
+        # For mixed colors, describe the dominant components
+        components = []
+        if r > 0.6:
+            components.append("reddish")
+        if g > 0.6:
+            components.append("greenish")
+        if b > 0.6:
+            components.append("bluish")
+        color_name = "-".join(components) if components else "mixed"
+    
+    # Generate descriptions using templates
+    descriptions = []
+    for template in templates:
+        description = template.format(
+            color=color_name,
+            r=r,
+            g=g,
+            b=b
+        )
+        descriptions.append(description)
+    
+    return descriptions
 
-    for _ in range(num_samples):
-        # Pick two distinct colors with enough brightness
-        color1, vec1 = random.choice(valid_colors)
-        color2, vec2 = random.choice(valid_colors)
-        while color2 == color1:
-            color2, vec2 = random.choice(valid_colors)
-        
-        # Add fuzziness to each color
-        fuzziness = np.random.uniform(-0.1, 0.1, size=3)
-        vec1_fuzzy = np.clip(np.array(vec1) + fuzziness, 0, 1)
-        vec2_fuzzy = np.clip(np.array(vec2) + fuzziness[::-1], 0, 1)
+def generate_dataset(num_samples: int = 1000) -> List[ColorSample]:
+    """Generate a dataset of color samples with descriptions"""
+    samples = []
+    
+    # Generate pure colors
+    pure_colors = [
+        (1.0, 0.0, 0.0),    # Red
+        (0.0, 1.0, 0.0),    # Green
+        (0.0, 0.0, 1.0),    # Blue
+        (1.0, 1.0, 0.0),    # Yellow
+        (1.0, 0.0, 1.0),    # Magenta
+        (0.0, 1.0, 1.0),    # Cyan
+        (1.0, 1.0, 1.0),    # White
+        (0.0, 0.0, 0.0),    # Black
+        (0.5, 0.5, 0.5),    # Gray
+    ]
+    
+    # Add pure colors to dataset
+    for rgb in pure_colors:
+        descriptions = generate_color_descriptions(rgb)
+        for description in descriptions:
+            samples.append(ColorSample(rgb=rgb, description=description))
+    
+    # Generate random colors
+    while len(samples) < num_samples:
+        rgb = (
+            random.random(),  # Random float between 0 and 1
+            random.random(),
+            random.random()
+        )
+        descriptions = generate_color_descriptions(rgb)
+        for description in descriptions:
+            samples.append(ColorSample(rgb=rgb, description=description))
+    
+    return samples
 
-        # Combine to form condition vector
-        condition = np.concatenate([vec1_fuzzy, vec2_fuzzy])
-        conditions.append(condition)
-
-        # Generate descriptive text
-        template = random.choice(PHRASE_TEMPLATES)
-        phrase = template.format(color1, color2)
-        texts.append({"text": phrase})
+def save_dataset(samples: List[ColorSample], output_dir: str):
+    """Save the dataset to files"""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # Save text data
-    with open(output_jsonl, 'w', encoding='utf-8') as f:
-        for item in texts:
+    text_data = []
+    all_text = ""
+    for sample in samples:
+        all_text+= sample.description
+        text_data.append({
+            "text": sample.description,
+            "rgb": sample.rgb
+        })
+ 
+    with open(output_dir / "raw_text.txt","w") as f:
+        f.write(all_text)
+    
+    with open(output_dir / "text_data.jsonl", "w") as f:
+        for item in text_data:
             f.write(json.dumps(item) + "\n")
+    
+    # Save RGB values as condition vectors
+    conditions = np.array([sample.rgb for sample in samples], dtype=np.float32)
+    np.save(output_dir / "conditions.npy", conditions)
+    
+    # Save metadata
+    metadata = {
+        "num_samples": len(samples),
+        "condition_dim": 3,  # RGB values
+        "description": "Color dataset with RGB values and descriptions"
+    }
+    with open(output_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
 
-    # Save condition vectors
-    np.save(output_npy, np.array(conditions, dtype=np.float32))
+def main():
+    # Generate dataset
+    print("Generating color dataset...")
+    samples = generate_dataset(num_samples=10000)
+    
+    # Save dataset
+    print("Saving dataset...")
+    save_dataset(samples, "color_dataset")
+    
+    print(f"Generated {len(samples)} samples")
+    print("Dataset saved to 'color_dataset' directory")
 
-    print(f"✅ Generated {num_samples} samples")
-    print(f"📝 Texts saved to: {output_jsonl}")
-    print(f"🧠 Conditions saved to: {output_npy}")
-
-# Run directly
 if __name__ == "__main__":
-    os.makedirs("rainbow_dataset", exist_ok=True)
-    generate_dataset(
-        output_jsonl="rainbow_dataset/text.jsonl",
-        output_npy="rainbow_dataset/conditions.npy",
-        num_samples=200,
-    )
+    main()
