@@ -18,7 +18,7 @@ class SPTokenizer:
             cache_dir = os.path.expanduser("~/.cache/sentencepiece")
         os.makedirs(cache_dir, exist_ok=True)
         """
-        model_path = name  #os.path.join(cache_dir, f"{name}.model")
+        model_path = f"{name}.model"  #os.path.join(cache_dir, f"{name}.model")
         if not os.path.exists(model_path):
             raise ValueError(f"Model {name} not found at {model_path}. Please train a SentencePiece model first.")
         

@@ -4,6 +4,8 @@ import math
 import pickle
 import argparse
 from contextlib import nullcontext
+from grokfast import gradfilter_ma, gradfilter_ema
+
 
 import numpy as np
 import torch
@@ -36,14 +38,14 @@ def get_args():
     parser.add_argument('--norm_eps', type=float, default=1e-5, help='Layer norm epsilon')
     parser.add_argument('--max_seq_len', type=int, default=2048, help='Maximum sequence length')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
-    parser.add_argument('--condition_dim', type=int, default=768, help='Dimension of condition vectors')
+    parser.add_argument('--condition_dim', type=int, default=1024, help='Dimension of condition vectors')
     parser.add_argument('--condition_proj_dim', type=int, default=None, help='Projection dimension for conditions')
     
     # Training parameters
     parser.add_argument('--tokenizer_name', type=str, default='sp_model', help='Name of the SentencePiece model')
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size per GPU')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
-    parser.add_argument('--max_iters', type=int, default=20000, help='Maximum number of training iterations')
+    parser.add_argument('--max_iters', type=int, default=80000, help='Maximum number of training iterations')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading')
     
     # Training parameters
@@ -68,7 +70,7 @@ def get_args():
     
     # Logging and saving
     parser.add_argument('--log_interval', type=int, default=1, help='Log training stats every N steps')
-    parser.add_argument('--save_interval', type=int, default=1000, help='Save checkpoint every N steps')
+    parser.add_argument('--save_interval', type=int, default=10000, help='Save checkpoint every N steps')
     parser.add_argument('--eval_interval', type=int, default=500, help='Evaluate every N steps')
     parser.add_argument('--eval_iters', type=int, default=100, help='Number of iterations for evaluation')
     parser.add_argument('--resume', type=str, default=None, help='Resume training from checkpoint')
@@ -212,6 +214,7 @@ def train(args):
     
     train_iter = iter(train_loader)
     t0 = time.time()
+    grads = None
     while True:
         # Termination condition
         if iter_num >= args.max_iters:
@@ -236,15 +239,22 @@ def train(args):
         
         # Forward and backward pass
         model.train()
-        with ctx:
-            # Forward pass
-            logits = model(tokens, condition=conditions, targets=targets)
-            loss = raw_model.last_loss
-            # Scale loss for gradient accumulation
-            loss = loss / args.gradient_accumulation_steps
-        
-        # Backward pass
-        loss.backward()
+        try:
+            with ctx:
+                # Forward pass
+                model(tokens, condition=conditions, targets=targets)
+                loss = raw_model.last_loss
+                loss = loss / args.gradient_accumulation_steps
+
+            # Backward pass
+            grads = gradfilter_ema(model, grads=grads)
+            loss.backward()
+
+        except Exception as e:
+            print(f"[Batch {iter_num}] ❌ Error: {type(e).__name__}: {e}")
+            torch.cuda.empty_cache()
+            optimizer.zero_grad(set_to_none=True)
+            continue
         
         # Gradient accumulation and update
         if (iter_num + 1) % args.gradient_accumulation_steps == 0:
@@ -328,12 +338,13 @@ def evaluate(model, dataloader, ctx, device, max_iters=None):
         tokens = batch['tokens'].to(device)
         conditions = batch['conditions'].to(device)
         targets = batch['targets'].to(device)
-        
-        with ctx:
-            logits = model(tokens, condition=conditions, targets=targets)
-            raw_model = model.module if isinstance(model, DDP) else model
-            loss = raw_model.last_loss
-        
+        try: 
+            with ctx:
+                model(tokens,condition=conditions, targets=targets)
+                raw_model = model.module if isinstance(model, DDP) else model
+                loss = raw_model.last_loss
+        except:
+            continue 
         losses.append(loss.item())
         
         if max_iters is None:

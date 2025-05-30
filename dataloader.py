@@ -3,7 +3,6 @@ import json
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Optional, Tuple, Union
 from tokenizer import get_encoding
 
 class MultimodalDataset(Dataset):
@@ -13,9 +12,9 @@ class MultimodalDataset(Dataset):
         self, 
         text_path: str,
         condition_path: str,
-        tokenizer_name: str = "sp_model",  # default to use our SentencePiece model
+        tokenizer_name: str = "robollama",  # default to use our SentencePiece model
         max_length: int = 2048,
-        condition_dim: int = 3,  # RGB values
+        condition_dim: int = 1024,  # RGB values
     ):
         """
         Args:
@@ -34,10 +33,9 @@ class MultimodalDataset(Dataset):
         # Load text data
         self.texts = []
         with open(text_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                item = json.loads(line)
-                self.texts.append(item['text'])
-        
+            self.texts = json.load(f)
+        for t in self.texts:
+            assert len(t) > 0
         # Load condition vectors
         if condition_path.endswith('.npy'):
             # Single file with all vectors
@@ -77,22 +75,63 @@ class MultimodalDataset(Dataset):
             'condition': torch.tensor(condition, dtype=torch.float32),
         }
 
+class BlindMultimodalDataset(Dataset):
+    """Dataset for training a multimodal LLM with paired text and fixed condition vectors"""
+
+    def __init__(
+        self, 
+        text_path: str,
+        tokenizer_name: str = "robollama",
+        max_length: int = 2048,
+        condition_dim: int = 1024,
+    ):
+        self.max_length = max_length
+        self.condition_dim = condition_dim
+
+        # Load tokenizer
+        self.tokenizer = get_encoding(tokenizer_name)
+        self.pad_token_id = getattr(self.tokenizer, "pad_token_id", 0)
+
+        # Load text data
+        self.texts = []
+        with open(text_path, 'r', encoding='utf-8') as f:
+            self.texts=json.load(f)
+        for t in self.texts:
+            assert len(t) > 0
+
+        # Fixed zero conditioning vector
+        self.fixed_condition = torch.ones(self.condition_dim, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        tokens = self.tokenizer.encode(text)
+        # Pad or truncate tokens
+        #if len(tokens) > self.max_length:
+        #    tokens = tokens[:self.max_length]
+        return {
+            'tokens': torch.tensor(tokens, dtype=torch.long),
+            'condition': self.fixed_condition.clone(),  # clone to prevent shared ref
+        }
+
 
 def create_dataloader(
     text_path: str,
     condition_path: str,
     batch_size: int,
     max_length: int = 2048,
-    tokenizer_name: str = "sp_model",
-    condition_dim: int = 3,  # RGB values
+    tokenizer_name: str = "robollama",
+    condition_dim: int = 1024,  # RGB values
     shuffle: bool = True,
     num_workers: int = 4,
 ):
     """Create a DataLoader for multimodal training data"""
     
-    dataset = MultimodalDataset(
+    dataset = BlindMultimodalDataset(
         text_path=text_path,
-        condition_path=condition_path,
+        #condition_path=condition_path,
         tokenizer_name=tokenizer_name,
         max_length=max_length,
         condition_dim=condition_dim,
@@ -125,7 +164,36 @@ def create_dataloader(
             'conditions': conditions,
             'targets': targets,
         }
-    
+
+    def collate_fn(batch):
+        # Get max sequence length in this batch
+        max_len = max([item['tokens'].size(0) for item in batch])
+        
+        # Prepare tensors with correct pad token
+        tokens = torch.full((len(batch), max_len), 0, dtype=torch.long)
+        targets = torch.full((len(batch), max_len), -1, dtype=torch.long)
+        attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
+        
+        # Stack conditions and ensure they are 2D
+        conditions = torch.stack([item['condition'] for item in batch])
+        if conditions.dim() == 3:
+            conditions = conditions.mean(dim=1)
+        
+        for i, item in enumerate(batch):
+            seq_len = item['tokens'].size(0)
+            tokens[i, :seq_len] = item['tokens']
+            attention_mask[i, :seq_len] = 1  # Mark non-padded positions
+            
+            # Create targets (next token prediction)
+            if seq_len > 1:
+                targets[i, :seq_len - 1] = item['tokens'][1:]
+        
+        return {
+            'tokens': tokens,
+            'conditions': conditions,
+            'targets': targets,
+            'attention_mask': attention_mask,
+        }
     return DataLoader(
         dataset,
         batch_size=batch_size,
